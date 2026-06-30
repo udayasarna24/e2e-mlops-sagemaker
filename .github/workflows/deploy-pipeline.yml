@@ -1,11 +1,17 @@
 name: Pipeline 3 - Deploy - Deploy Model to Endpoint
 
 on:
+  push:
+    branches:
+      - master
+    paths:
+      - '.github/workflows/deploy-pipeline.yml'
   workflow_dispatch:
 
 jobs:
   deploy-model:
     runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch'
 
     steps:
       - name: Checkout Code
