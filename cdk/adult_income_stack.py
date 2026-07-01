@@ -1,7 +1,6 @@
 import os
 import json
-import zipfile
-import tempfile
+import boto3
 import aws_cdk as cdk
 from constructs import Construct
 
@@ -14,7 +13,6 @@ from aws_cdk import (
     aws_lambda as lambda_,
     aws_events as events,
     aws_events_targets as targets,
-    aws_ec2 as ec2,
     aws_sagemaker as sagemaker,
     aws_secretsmanager as secretsmanager,
 )
@@ -34,11 +32,27 @@ class AdultIncomeSageMakerStack(Stack):
         account = self.account
         region  = self.region
 
+        # ─── Get VPC + Subnets via boto3 (avoids CDK synth-time lookup) ─
+        ec2_client = boto3.client("ec2", region_name=os.environ.get("AWS_REGION", "us-east-1"))
+
+        vpcs = ec2_client.describe_vpcs(
+            Filters=[{"Name": "isDefault", "Values": ["true"]}]
+        )
+        vpc_id = vpcs["Vpcs"][0]["VpcId"]
+
+        subnets = ec2_client.describe_subnets(
+            Filters=[{"Name": "vpc-id", "Values": [vpc_id]}]
+        )
+        subnet_ids = [s["SubnetId"] for s in subnets["Subnets"]][:2]
+
+        print(f"✅ VPC ID   : {vpc_id}")
+        print(f"✅ Subnets  : {subnet_ids}")
+
         # ─── 1. S3 Bucket ───────────────────────────────────
         bucket = s3.Bucket(
             self, "TrainingBucket",
             bucket_name=f"sagemaker-adult-income-pipeline-{account}",
-            removal_policy=RemovalPolicy.RETAIN,  # Keep data if stack deleted
+            removal_policy=RemovalPolicy.RETAIN,
             block_public_access=s3.BlockPublicAccess.BLOCK_ALL
         )
 
@@ -58,18 +72,7 @@ class AdultIncomeSageMakerStack(Stack):
             ]
         )
 
-        # ─── 3. VPC Lookup (use default VPC) ────────────────
-        vpc = ec2.Vpc.from_lookup(
-            self, "DefaultVpc",
-            is_default=True
-        )
-
-        subnet_ids = [
-            subnet.subnet_id
-            for subnet in vpc.public_subnets[:2]
-        ]
-
-        # ─── 4. SageMaker Studio Domain ─────────────────────
+        # ─── 3. SageMaker Studio Domain ─────────────────────
         domain = sagemaker.CfnDomain(
             self, "StudioDomain",
             domain_name="adult-income-sagemaker-studio",
@@ -92,7 +95,7 @@ class AdultIncomeSageMakerStack(Stack):
                     )
             ),
             subnet_ids=subnet_ids,
-            vpc_id=vpc.vpc_id,
+            vpc_id=vpc_id,
             tags=[
                 cdk.CfnTag(key="Project",     value="Adult-Income-Pipeline"),
                 cdk.CfnTag(key="Environment", value="dev"),
@@ -100,7 +103,7 @@ class AdultIncomeSageMakerStack(Stack):
             ]
         )
 
-        # ─── 5. SageMaker User Profile ───────────────────────
+        # ─── 4. SageMaker User Profile ───────────────────────
         user_profile = sagemaker.CfnUserProfile(
             self, "StudioUserProfile",
             domain_id=domain.attr_domain_id,
@@ -111,16 +114,13 @@ class AdultIncomeSageMakerStack(Stack):
         )
         user_profile.node.add_dependency(domain)
 
-        # ─── 6. GitHub Token Secret (must exist in Secrets Manager) ─
-        # NOTE: The actual secret VALUE must be created manually once:
-        # aws secretsmanager create-secret --name github-token
-        #   --secret-string "ghp_xxxx" --region us-east-1
+        # ─── 5. GitHub Token Secret Reference ───────────────
         github_token_secret = secretsmanager.Secret.from_secret_name_v2(
             self, "GitHubTokenSecret",
             "github-token"
         )
 
-        # ─── 7. Lambda Execution Role ───────────────────────
+        # ─── 6. Lambda Execution Role ───────────────────────
         lambda_role = iam.Role(
             self, "LambdaDeployTriggerRole",
             role_name="LambdaAdultDeployTriggerRole",
@@ -133,10 +133,9 @@ class AdultIncomeSageMakerStack(Stack):
             ]
         )
 
-        # Allow Lambda to read the GitHub token secret
         github_token_secret.grant_read(lambda_role)
 
-        # ─── 8. Lambda Function ─────────────────────────────
+        # ─── 7. Lambda Function ─────────────────────────────
         lambda_code = f"""
 import json
 import urllib.request
@@ -194,7 +193,7 @@ def lambda_handler(event, context):
             description="Triggers GitHub Actions Pipeline 3 on Adult Income model approval"
         )
 
-        # ─── 9. EventBridge Rule ─────────────────────────────
+        # ─── 8. EventBridge Rule ─────────────────────────────
         model_approved_rule = events.Rule(
             self, "ModelApprovedRule",
             rule_name="adult-model-approved-rule",
@@ -209,17 +208,12 @@ def lambda_handler(event, context):
             )
         )
 
-        # ─── 10. Wire EventBridge → Lambda ──────────────────
+        # ─── 9. Wire EventBridge → Lambda ────────────────────
         model_approved_rule.add_target(
             targets.LambdaFunction(deploy_trigger_fn)
         )
 
-        # ─── 11. Save Infra Outputs to S3 ───────────────────
-        # This is handled separately in the GitHub Actions workflow
-        # using a small boto3 script that reads CDK outputs
-        # (see infra-pipeline.yml)
-
-        # ─── 12. CloudFormation Outputs ──────────────────────
+        # ─── 10. CloudFormation Outputs ──────────────────────
         CfnOutput(
             self, "DomainId",
             value=domain.attr_domain_id,
