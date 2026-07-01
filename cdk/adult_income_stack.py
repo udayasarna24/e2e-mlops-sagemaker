@@ -51,7 +51,7 @@ class AdultIncomeSageMakerStack(Stack):
         # ─── 1. S3 Bucket ───────────────────────────────────
         bucket = s3.Bucket(
             self, "TrainingBucket",
-            bucket_name=f"sagemaker-adult-income-pipeline-{account}",
+            bucket_name=f"sagemaker-adult-income-cdk-{account}",
             removal_policy=RemovalPolicy.RETAIN,
             block_public_access=s3.BlockPublicAccess.BLOCK_ALL
         )

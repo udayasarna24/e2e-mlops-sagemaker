@@ -12,7 +12,7 @@ def save_outputs():
     region   = os.environ.get("AWS_REGION", "us-east-1")
     account  = boto3.client("sts", region_name=region)\
                     .get_caller_identity()["Account"]
-    bucket   = f"sagemaker-adult-income-pipeline-{account}"
+    bucket   = f"sagemaker-adult-income-cdk-{account}"
 
     cf_client = boto3.client("cloudformation", region_name=region)
     s3_client = boto3.client("s3",             region_name=region)

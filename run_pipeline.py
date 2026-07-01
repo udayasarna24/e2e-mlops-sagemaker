@@ -21,7 +21,7 @@ def run_pipeline():
     region  = os.environ.get("AWS_REGION", "us-east-1")
     account = boto3.client("sts", region_name=region)\
                    .get_caller_identity()["Account"]
-    bucket  = f"sagemaker-adult-income-pipeline-{account}"
+    bucket  = f"sagemaker-adult-income-cdk-{account}"
 
     boto_session = boto3.Session(region_name=region)
     sm_client    = boto3.client("sagemaker", region_name=region)
