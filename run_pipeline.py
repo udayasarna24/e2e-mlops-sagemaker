@@ -113,8 +113,15 @@ def run_pipeline():
         max_run=3600,
         max_wait=7200,
         sagemaker_session=session,
+        hyperparameters={
+            "n_estimators": 100,
+            "random_state": 42
+        },
         metric_definitions=[
-            {"Name": "accuracy", "Regex": "accuracy: ([0-9\\.]+)"}
+            {"Name": "accuracy",  "Regex": "accuracy: ([0-9\\.]+)"},
+            {"Name": "precision", "Regex": "precision: ([0-9\\.]+)"},
+            {"Name": "recall",    "Regex": "recall: ([0-9\\.]+)"},
+            {"Name": "f1",        "Regex": "f1: ([0-9\\.]+)"}
         ]
     )
 
