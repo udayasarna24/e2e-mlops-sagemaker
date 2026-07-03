@@ -1,4 +1,4 @@
-# e2e MLOps test 03/07/2026
+# e2e MLOps test 04/07/2026
 import boto3
 import sagemaker
 import os
