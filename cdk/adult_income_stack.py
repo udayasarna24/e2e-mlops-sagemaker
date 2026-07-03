@@ -1,5 +1,4 @@
 import os
-import json
 import boto3
 import aws_cdk as cdk
 from constructs import Construct
@@ -18,16 +17,16 @@ from aws_cdk import (
 )
 
 
-def resource_exists(client, check_fn):
-    """Helper to check if a resource exists."""
-    try:
-        check_fn(client)
-        return True
-    except Exception:
-        return False
-
-
 class AdultIncomeSageMakerStack(Stack):
+    """
+    Ownership model:
+      - Resources DEFINED below are owned by this stack, unconditionally.
+        CloudFormation decides create-vs-update by itself — never check
+        existence at synth time and switch to an import, or CloudFormation
+        will treat the resource as removed and DELETE it on the next deploy.
+      - Only genuinely external resources (the S3 bucket, the GitHub token
+        secret, the default VPC) are referenced/imported.
+    """
 
     def __init__(
         self,
@@ -39,16 +38,13 @@ class AdultIncomeSageMakerStack(Stack):
         super().__init__(scope, construct_id, **kwargs)
 
         account  = self.account
-        region   = self.region
         aws_region = os.environ.get("AWS_REGION", "us-east-1")
 
-        # ─── Boto3 Clients ───────────────────────────────────
-        ec2_client = boto3.client("ec2",        region_name=aws_region)
-        iam_client = boto3.client("iam",        region_name=aws_region)
-        sm_client  = boto3.client("sagemaker",  region_name=aws_region)
-        s3_client  = boto3.client("s3",         region_name=aws_region)
+        # ─── Boto3 Clients (external lookups only) ───────────
+        ec2_client = boto3.client("ec2", region_name=aws_region)
+        s3_client  = boto3.client("s3",  region_name=aws_region)
 
-        # ─── VPC + Subnets ───────────────────────────────────
+        # ─── VPC + Subnets (external — default VPC) ──────────
         vpcs = ec2_client.describe_vpcs(
             Filters=[{"Name": "isDefault", "Values": ["true"]}]
         )
@@ -60,7 +56,10 @@ class AdultIncomeSageMakerStack(Stack):
         print(f"✅ VPC ID   : {vpc_id}")
         print(f"✅ Subnets  : {subnet_ids}")
 
-        # ─── 1. S3 Bucket — Import if Exists ─────────────────
+        # ─── 1. S3 Bucket — external, import if exists ───────
+        # The bucket holds training data and pipeline outputs, and
+        # run_pipeline.py also creates it if missing — it outlives this
+        # stack on purpose. RETAIN protects it if the stack ever created it.
         bucket_name = f"sagemaker-adult-income-cdk-{account}"
         try:
             s3_client.head_bucket(Bucket=bucket_name)
@@ -78,138 +77,89 @@ class AdultIncomeSageMakerStack(Stack):
                 block_public_access=s3.BlockPublicAccess.BLOCK_ALL
             )
 
-        # ─── 2. SageMaker Execution Role — Import if Exists ──
-        sagemaker_role_name = "AdultIncomeSageMakerExecutionRole"
-        try:
-            existing_role = iam_client.get_role(RoleName=sagemaker_role_name)
-            role_arn = existing_role["Role"]["Arn"]
-            print(f"✅ SageMaker Role exists — importing: {sagemaker_role_name}")
-            sagemaker_role = iam.Role.from_role_arn(
-                self, "SageMakerExecutionRole",
-                role_arn
-            )
-        except iam_client.exceptions.NoSuchEntityException:
-            print(f"⏳ SageMaker Role not found — creating: {sagemaker_role_name}")
-            sagemaker_role = iam.Role(
-                self, "SageMakerExecutionRole",
-                role_name=sagemaker_role_name,
-                assumed_by=iam.ServicePrincipal("sagemaker.amazonaws.com"),
-                description="SageMaker execution role for Adult Income pipeline",
-                managed_policies=[
-                    iam.ManagedPolicy.from_aws_managed_policy_name(
-                        "AmazonSageMakerFullAccess"
-                    ),
-                    iam.ManagedPolicy.from_aws_managed_policy_name(
-                        "AmazonS3FullAccess"
-                    )
-                ]
-            )
-
-        # ─── 3. SageMaker Studio Domain — Import if Exists ───
-        domain_name = "adult-income-sagemaker-studio-cdk"
-        existing_domains = sm_client.list_domains()
-        existing_domain  = next(
-            (d for d in existing_domains["Domains"]
-             if d["DomainName"] == domain_name),
-            None
+        # ─── 2. SageMaker Execution Role ─────────────────────
+        sagemaker_role = iam.Role(
+            self, "SageMakerExecutionRole",
+            role_name="AdultIncomeSageMakerExecutionRole",
+            assumed_by=iam.ServicePrincipal("sagemaker.amazonaws.com"),
+            description="SageMaker execution role for Adult Income pipeline",
+            managed_policies=[
+                iam.ManagedPolicy.from_aws_managed_policy_name(
+                    "AmazonSageMakerFullAccess"
+                ),
+                iam.ManagedPolicy.from_aws_managed_policy_name(
+                    "AmazonS3FullAccess"
+                )
+            ]
         )
 
-        if existing_domain:
-            domain_id = existing_domain["DomainId"]
-            print(f"✅ Studio Domain exists — importing: {domain_name} ({domain_id})")
-            # Reference domain ID directly (no CDK construct needed)
-            domain_id_value = domain_id
-        else:
-            print(f"⏳ Studio Domain not found — creating: {domain_name}")
-            domain = sagemaker.CfnDomain(
-                self, "StudioDomain",
-                domain_name=domain_name,
-                auth_mode="IAM",
-                default_user_settings=sagemaker.CfnDomain.UserSettingsProperty(
-                    execution_role=sagemaker_role.role_arn,
-                    jupyter_server_app_settings=sagemaker.CfnDomain\
-                        .JupyterServerAppSettingsProperty(
-                            default_resource_spec=sagemaker.CfnDomain\
-                                .ResourceSpecProperty(
-                                    instance_type="system"
-                                )
-                        ),
-                    kernel_gateway_app_settings=sagemaker.CfnDomain\
-                        .KernelGatewayAppSettingsProperty(
-                            default_resource_spec=sagemaker.CfnDomain\
-                                .ResourceSpecProperty(
-                                    instance_type="ml.t3.medium"
-                                )
-                        )
-                ),
-                subnet_ids=subnet_ids,
-                vpc_id=vpc_id,
-                tags=[
-                    cdk.CfnTag(key="Project",     value="Adult-Income-Pipeline"),
-                    cdk.CfnTag(key="Environment", value="dev"),
-                    cdk.CfnTag(key="ManagedBy",   value="CDK")
-                ]
-            )
-            domain_id_value = domain.attr_domain_id
+        # ─── 3. SageMaker Studio Domain ──────────────────────
+        domain = sagemaker.CfnDomain(
+            self, "StudioDomain",
+            domain_name="adult-income-sagemaker-studio-cdk",
+            auth_mode="IAM",
+            default_user_settings=sagemaker.CfnDomain.UserSettingsProperty(
+                execution_role=sagemaker_role.role_arn,
+                jupyter_server_app_settings=sagemaker.CfnDomain\
+                    .JupyterServerAppSettingsProperty(
+                        default_resource_spec=sagemaker.CfnDomain\
+                            .ResourceSpecProperty(
+                                instance_type="system"
+                            )
+                    ),
+                kernel_gateway_app_settings=sagemaker.CfnDomain\
+                    .KernelGatewayAppSettingsProperty(
+                        default_resource_spec=sagemaker.CfnDomain\
+                            .ResourceSpecProperty(
+                                instance_type="ml.t3.medium"
+                            )
+                    )
+            ),
+            subnet_ids=subnet_ids,
+            vpc_id=vpc_id,
+            tags=[
+                cdk.CfnTag(key="Project",     value="Adult-Income-Pipeline"),
+                cdk.CfnTag(key="Environment", value="dev"),
+                cdk.CfnTag(key="ManagedBy",   value="CDK")
+            ]
+        )
+        # Safety net: if a template mistake ever drops the domain,
+        # CloudFormation orphans it instead of deleting the workspace
+        domain.apply_removal_policy(RemovalPolicy.RETAIN)
 
-        # ─── 4. User Profile — Create Only if Domain is New ──
-        if not existing_domain:
-            user_profile = sagemaker.CfnUserProfile(
-                self, "StudioUserProfile",
-                domain_id=domain_id_value,
-                user_profile_name="adult-income-user",
-                user_settings=sagemaker.CfnUserProfile.UserSettingsProperty(
-                    execution_role=sagemaker_role.role_arn
-                )
+        # ─── 4. Studio User Profile ──────────────────────────
+        user_profile = sagemaker.CfnUserProfile(
+            self, "StudioUserProfile",
+            domain_id=domain.attr_domain_id,
+            user_profile_name="adult-income-user",
+            user_settings=sagemaker.CfnUserProfile.UserSettingsProperty(
+                execution_role=sagemaker_role.role_arn
             )
-            user_profile.node.add_dependency(domain)
+        )
+        user_profile.node.add_dependency(domain)
 
-        # ─── 5. GitHub Token Secret Reference ────────────────
+        # ─── 5. GitHub Token Secret Reference (external) ─────
         github_token_secret = secretsmanager.Secret.from_secret_name_v2(
             self, "GitHubTokenSecret",
             "github-token"
         )
 
-        # ─── 6. Lambda Role — Import if Exists ───────────────
-        lambda_role_name = "LambdaAdultDeployTriggerRole"
-        try:
-            existing_lambda_role = iam_client.get_role(RoleName=lambda_role_name)
-            lambda_role_arn = existing_lambda_role["Role"]["Arn"]
-            print(f"✅ Lambda Role exists — importing: {lambda_role_name}")
-            lambda_role = iam.Role.from_role_arn(
-                self, "LambdaDeployTriggerRole",
-                lambda_role_arn
-            )
-        except iam_client.exceptions.NoSuchEntityException:
-            print(f"⏳ Lambda Role not found — creating: {lambda_role_name}")
-            lambda_role = iam.Role(
-                self, "LambdaDeployTriggerRole",
-                role_name=lambda_role_name,
-                assumed_by=iam.ServicePrincipal("lambda.amazonaws.com"),
-                description="Lambda role to trigger GitHub Actions (Adult Income)",
-                managed_policies=[
-                    iam.ManagedPolicy.from_aws_managed_policy_name(
-                        "service-role/AWSLambdaBasicExecutionRole"
-                    )
-                ]
-            )
-            github_token_secret.grant_read(lambda_role)
+        # ─── 6. Lambda Role ──────────────────────────────────
+        lambda_role = iam.Role(
+            self, "LambdaDeployTriggerRole",
+            role_name="LambdaAdultDeployTriggerRole",
+            assumed_by=iam.ServicePrincipal("lambda.amazonaws.com"),
+            description="Lambda role to trigger GitHub Actions (Adult Income)",
+            managed_policies=[
+                iam.ManagedPolicy.from_aws_managed_policy_name(
+                    "service-role/AWSLambdaBasicExecutionRole"
+                )
+            ]
+        )
+        github_token_secret.grant_read(lambda_role)
 
-        # ─── 7. Lambda Function — Import if Exists ───────────
-        lambda_name = "trigger-adult-deploy-pipeline"
-        lambda_client = boto3.client("lambda", region_name=aws_region)
-
-        try:
-            existing_fn = lambda_client.get_function(FunctionName=lambda_name)
-            lambda_arn  = existing_fn["Configuration"]["FunctionArn"]
-            print(f"✅ Lambda exists — importing: {lambda_name}")
-            deploy_trigger_fn = lambda_.Function.from_function_arn(
-                self, "DeployTriggerLambda",
-                lambda_arn
-            )
-        except lambda_client.exceptions.ResourceNotFoundException:
-            print(f"⏳ Lambda not found — creating: {lambda_name}")
-            lambda_code = f"""
+        # ─── 7. Lambda Function ──────────────────────────────
+        lambda_code = f"""
 import json
 import urllib.request
 import boto3
@@ -251,18 +201,18 @@ def lambda_handler(event, context):
         print(f"Failed to trigger: {{str(e)}}")
         raise
 """
-            deploy_trigger_fn = lambda_.Function(
-                self, "DeployTriggerLambda",
-                function_name=lambda_name,
-                runtime=lambda_.Runtime.PYTHON_3_10,
-                handler="index.lambda_handler",
-                code=lambda_.Code.from_inline(lambda_code),
-                role=lambda_role,
-                timeout=cdk.Duration.seconds(30),
-                description="Triggers GitHub Actions Pipeline 3 on Adult Income model approval"
-            )
+        deploy_trigger_fn = lambda_.Function(
+            self, "DeployTriggerLambda",
+            function_name="trigger-adult-deploy-pipeline",
+            runtime=lambda_.Runtime.PYTHON_3_10,
+            handler="index.lambda_handler",
+            code=lambda_.Code.from_inline(lambda_code),
+            role=lambda_role,
+            timeout=cdk.Duration.seconds(30),
+            description="Triggers GitHub Actions Pipeline 3 on Adult Income model approval"
+        )
 
-        # ─── 8. EventBridge Rule — Always Upsert ─────────────
+        # ─── 8. EventBridge Rule ─────────────────────────────
         model_approved_rule = events.Rule(
             self, "ModelApprovedRule",
             rule_name="adult-model-approved-rule",
@@ -283,8 +233,7 @@ def lambda_handler(event, context):
         # ─── 9. CloudFormation Outputs ────────────────────────
         CfnOutput(
             self, "DomainId",
-            value=domain_id_value if isinstance(domain_id_value, str)
-                  else domain_id_value,
+            value=domain.attr_domain_id,
             description="SageMaker Studio Domain ID",
             export_name="AdultIncomeDomainId"
         )
