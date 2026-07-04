@@ -1,5 +1,5 @@
 # touched to force GitHub to register this dispatch-only workflow
-name: Pipeline 3 - Deploy - Deploy Model to Endpoint v7
+name: Pipeline 3 - Deploy - Deploy Model to Endpoint v1
 
 on:
   workflow_dispatch:

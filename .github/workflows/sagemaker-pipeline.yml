@@ -1,4 +1,4 @@
-name: Pipeline 2 - ML - Train and Register Model
+name: Pipeline 2 - ML - Train and Register Model v1
 
 on:
   workflow_run:
